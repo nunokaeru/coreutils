@@ -21,9 +21,9 @@ use uucore::show_error;
 use uucore::translate;
 
 use super::super::{
-    InteractiveMode, Options, is_dir_empty, is_readable_metadata, prompt_descend, remove_file,
-    show_permission_denied_error, show_removal_error, verbose_removed_directory,
-    verbose_removed_file,
+    InteractiveMode, Options, PreservedPaths, is_dir_empty, is_readable_metadata, prompt_descend,
+    remove_file, should_preserve_path, show_permission_denied_error, show_preserve_root_error,
+    show_removal_error, verbose_removed_directory, verbose_removed_file,
 };
 
 #[inline]
@@ -276,6 +276,7 @@ pub fn safe_remove_dir_recursive(
     path: &Path,
     options: &Options,
     progress_bar: Option<&ProgressBar>,
+    paths_to_preserve: &PreservedPaths,
 ) -> bool {
     // Base case 1: this is a file or a symbolic link.
     // Use lstat to avoid race condition between check and use
@@ -288,6 +289,13 @@ pub fn safe_remove_dir_recursive(
             return show_removal_error(e, path);
         }
     };
+
+    // Base case 2: We can potentially be symlinked to a
+    // path that should be preserved.
+    if should_preserve_path(path, paths_to_preserve) {
+        show_preserve_root_error(path, options);
+        return true;
+    }
 
     // Try to open the directory using DirFd for secure traversal
     let dir_fd = match DirFd::open(path) {
@@ -309,7 +317,7 @@ pub fn safe_remove_dir_recursive(
         }
     };
 
-    let error = safe_remove_dir_recursive_impl(path, &dir_fd, options);
+    let error = safe_remove_dir_recursive_impl(path, &dir_fd, options, paths_to_preserve);
 
     // After processing all children, remove the directory itself
     if error {
@@ -346,7 +354,12 @@ pub fn safe_remove_dir_recursive(
 }
 
 #[cfg(not(target_os = "redox"))]
-pub fn safe_remove_dir_recursive_impl(path: &Path, dir_fd: &DirFd, options: &Options) -> bool {
+pub fn safe_remove_dir_recursive_impl(
+    path: &Path,
+    dir_fd: &DirFd,
+    options: &Options,
+    paths_to_preserve: &PreservedPaths,
+) -> bool {
     // Read directory entries using safe traversal
     let entries = match dir_fd.read_dir() {
         Ok(entries) => entries,
@@ -379,6 +392,12 @@ pub fn safe_remove_dir_recursive_impl(path: &Path, dir_fd: &DirFd, options: &Opt
         // Check if it's a directory
         let is_dir = ((entry_stat.st_mode as libc::mode_t) & libc::S_IFMT) == libc::S_IFDIR;
 
+        if should_preserve_path(&entry_path, paths_to_preserve) {
+            show_preserve_root_error(&entry_path, options);
+            error = true;
+            continue;
+        }
+
         if is_dir {
             // Ask user if they want to descend into this directory
             if options.interactive == InteractiveMode::Always
@@ -408,7 +427,12 @@ pub fn safe_remove_dir_recursive_impl(path: &Path, dir_fd: &DirFd, options: &Opt
                 }
             };
 
-            let child_error = safe_remove_dir_recursive_impl(&entry_path, &child_dir_fd, options);
+            let child_error = safe_remove_dir_recursive_impl(
+                &entry_path,
+                &child_dir_fd,
+                options,
+                paths_to_preserve,
+            );
             error |= child_error;
 
             // Ask user permission if needed for this subdirectory
@@ -435,7 +459,12 @@ pub fn safe_remove_dir_recursive_impl(path: &Path, dir_fd: &DirFd, options: &Opt
 }
 
 #[cfg(target_os = "redox")]
-pub fn safe_remove_dir_recursive_impl(_path: &Path, _dir_fd: &DirFd, _options: &Options) -> bool {
+pub fn safe_remove_dir_recursive_impl(
+    _path: &Path,
+    _dir_fd: &DirFd,
+    _options: &Options,
+    _paths_to_preserve: &PreservedPaths,
+) -> bool {
     // safe_traversal stat_at is not supported on Redox
     // This shouldn't be called on Redox, but provide a stub for compilation
     true // Return error

@@ -8,12 +8,15 @@
 use clap::builder::{PossibleValue, ValueParser};
 use clap::{Arg, ArgAction, Command, parser::ValueSource};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io::{self, IsTerminal, stdin};
 use std::ops::BitOr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::MAIN_SEPARATOR;
@@ -470,6 +473,94 @@ fn count_files_in_directory(p: &Path) -> u64 {
     1 + entries_count
 }
 
+#[cfg(unix)]
+pub type PreservedPaths = HashSet<(u64, u64)>;
+
+#[cfg(not(unix))]
+pub type PreservedPaths = HashSet<()>;
+
+#[cfg(unix)]
+fn build_preserved_paths(options: &Options) -> PreservedPaths {
+    let mut preserved = HashSet::new();
+
+    if options.preserve_root {
+        if let Ok(metadata) = fs::symlink_metadata("/") {
+            let dev = metadata.dev();
+            let ino = metadata.ino();
+            preserved.insert((dev, ino));
+        }
+    }
+
+    preserved
+}
+
+#[cfg(not(unix))]
+fn build_preserved_paths(_options: &Options) -> PreservedPaths {
+    HashSet::new()
+}
+
+#[cfg(unix)]
+pub fn should_preserve_path(path: &Path, paths_to_preserve: &PreservedPaths) -> bool {
+    if let Ok(metadata) = fs::metadata(path) {
+        let dev = metadata.dev();
+        let ino = metadata.ino();
+        if paths_to_preserve.contains(&(dev, ino)) {
+            return true;
+        }
+    }
+    for ancestor in path.ancestors() {
+        if ancestor == path {
+            continue;
+        }
+        if let Ok(metadata) = fs::metadata(ancestor) {
+            let dev = metadata.dev();
+            let ino = metadata.ino();
+            if paths_to_preserve.contains(&(dev, ino)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+pub fn add_preserved_path(paths_to_preserve: &mut PreservedPaths, path: &Path) -> bool {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let dev = metadata.dev();
+        let ino = metadata.ino();
+        paths_to_preserve.insert((dev, ino));
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(unix))]
+fn should_preserve_path(_path: &Path, _preserved: &PreservedPaths) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn show_preserve_root_error(path: &Path, options: &Options) {
+    if !options.preserve_root {
+        return;
+    }
+
+    let path_looks_like_root = path.has_root() && path.parent().is_none();
+    if path_looks_like_root {
+        show_error!("{}", RmError::DangerousRecursiveOperation);
+    } else {
+        show_error!(
+            "it is dangerous to operate recursively on {} (same as '/')",
+            path.quote()
+        );
+    }
+    show_error!("{}", RmError::UseNoPreserveRoot);
+}
+
+#[cfg(not(unix))]
+fn show_preserve_root_error(_path: &Path, _options: &Options) {}
+
 // TODO: implement one-file-system (this may get partially implemented in walkdir)
 /// Remove (or unlink) the given files
 ///
@@ -479,6 +570,8 @@ fn count_files_in_directory(p: &Path) -> u64 {
 /// details.
 pub fn remove(files: &[&OsStr], options: &Options) -> bool {
     let mut had_err = false;
+
+    let paths_to_preserve = build_preserved_paths(options);
 
     // Check if any files actually exist before creating progress bar
     let mut progress_bar: Option<ProgressBar> = None;
@@ -495,8 +588,15 @@ pub fn remove(files: &[&OsStr], options: &Options) -> bool {
                 }
 
                 any_files_processed = true;
-                if metadata.is_dir() {
-                    handle_dir(file, options, progress_bar.as_ref())
+                // A symlinked file can be removed even
+                // if it's parent is preserved.
+                if metadata.is_symlink() && !options.recursive {
+                    remove_file(file, options, progress_bar.as_ref())
+                } else if should_preserve_path(file, &paths_to_preserve) {
+                    show_preserve_root_error(file, options);
+                    true
+                } else if metadata.is_dir() {
+                    handle_dir(file, options, progress_bar.as_ref(), &paths_to_preserve)
                 } else if is_symlink_dir(&metadata) {
                     remove_dir(file, options, progress_bar.as_ref())
                 } else {
@@ -574,8 +674,15 @@ fn remove_dir_recursive(
     path: &Path,
     options: &Options,
     progress_bar: Option<&ProgressBar>,
+    paths_to_preserve: &PreservedPaths,
 ) -> bool {
-    // Base case 1: this is a file or a symbolic link.
+    // Base case 1: check if this path shouldn't be removed.
+    if should_preserve_path(path, paths_to_preserve) {
+        show_preserve_root_error(path, options);
+        return true; // Return error
+    }
+
+    // Base case 2: this is a file or a symbolic link.
     //
     // The symbolic link case is important because it could be a link to
     // a directory and we don't want to recurse. In particular, this
@@ -585,7 +692,7 @@ fn remove_dir_recursive(
         return remove_file(path, options, progress_bar);
     }
 
-    // Base case 2: this is a non-empty directory, but the user
+    // Base case 3: this is a non-empty directory, but the user
     // doesn't want to descend into it.
     if options.interactive == InteractiveMode::Always
         && !is_dir_empty(path)
@@ -597,7 +704,7 @@ fn remove_dir_recursive(
     // Use secure traversal on Unix (except Redox) for all recursive directory removals
     #[cfg(all(unix, not(target_os = "redox")))]
     {
-        safe_remove_dir_recursive(path, options, progress_bar)
+        safe_remove_dir_recursive(path, options, progress_bar, paths_to_preserve)
     }
 
     // Fallback for non-Unix, Redox, or use fs::remove_dir_all for very long paths
@@ -630,8 +737,17 @@ fn remove_dir_recursive(
                     match entry {
                         Err(_) => error = true,
                         Ok(entry) => {
-                            let child_error =
-                                remove_dir_recursive(&entry.path(), options, progress_bar);
+                            if should_preserve_path(&entry.path(), paths_to_preserve) {
+                                show_preserve_root_error(&entry.path(), options);
+                                error = true;
+                                continue;
+                            }
+                            let child_error = remove_dir_recursive(
+                                &entry.path(),
+                                options,
+                                progress_bar,
+                                paths_to_preserve,
+                            );
                             error = error || child_error;
                         }
                     }
@@ -639,17 +755,18 @@ fn remove_dir_recursive(
             }
         }
 
-        // Ask the user whether to remove the current directory.
         if options.interactive == InteractiveMode::Always && !prompt_dir(path, options) {
             return false;
         }
 
-        // Try removing the directory itself.
         match fs::remove_dir(path) {
-            Err(_) if !error && !is_readable(path) => {
-                // For compatibility with GNU test case
-                // `tests/rm/unread2.sh`, show "Permission denied" in this
-                // case instead of "Directory not empty".
+            #[cfg(unix)]
+            Err(_) if !error && !fs::metadata(path).is_ok_and(|m| is_readable_metadata(&m)) => {
+                show_permission_denied_error(path);
+                error = true;
+            }
+            #[cfg(not(unix))]
+            Err(_) if !error => {
                 show_permission_denied_error(path);
                 error = true;
             }
@@ -660,12 +777,7 @@ fn remove_dir_recursive(
                 show_error!("{e}");
                 error = true;
             }
-            Err(_) => {
-                // If there has already been at least one error when
-                // trying to remove the children, then there is no need to
-                // show another error message as we return from each level
-                // of the recursion.
-            }
+            Err(_) => {}
             Ok(_) => verbose_removed_directory(path, options),
         }
 
@@ -673,8 +785,16 @@ fn remove_dir_recursive(
     }
 }
 
-fn handle_dir(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
-    let mut had_err = false;
+fn handle_dir(
+    path: &Path,
+    options: &Options,
+    progress_bar: Option<&ProgressBar>,
+    paths_to_preserve: &PreservedPaths,
+) -> bool {
+    if should_preserve_path(path, paths_to_preserve) {
+        show_preserve_root_error(path, options);
+        return true;
+    }
 
     let path = clean_trailing_slashes(path);
     if path_is_current_or_parent_directory(path) {
@@ -685,15 +805,11 @@ fn handle_dir(path: &Path, options: &Options, progress_bar: Option<&ProgressBar>
         return true;
     }
 
-    let is_root = path.has_root() && path.parent().is_none();
-    if options.recursive && (!is_root || !options.preserve_root) {
-        had_err = remove_dir_recursive(path, options, progress_bar);
-    } else if options.dir && (!is_root || !options.preserve_root) {
+    let mut had_err = false;
+    if options.recursive {
+        had_err = remove_dir_recursive(path, options, progress_bar, paths_to_preserve);
+    } else if options.dir {
         had_err = remove_dir(path, options, progress_bar).bitor(had_err);
-    } else if options.recursive {
-        show_error!("{}", RmError::DangerousRecursiveOperation);
-        show_error!("{}", RmError::UseNoPreserveRoot);
-        had_err = true;
     } else {
         show_error!(
             "{}",
@@ -962,7 +1078,9 @@ fn is_symlink_dir(metadata: &Metadata) -> bool {
         && ((metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0)
 }
 
+#[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     // Testing whether path the `/////` collapses to `/`
@@ -973,5 +1091,91 @@ mod tests {
         let path = Path::new("/////");
 
         assert_eq!(Path::new("/"), clean_trailing_slashes(path));
+    }
+
+    #[cfg(unix)]
+    mod preserve_tests {
+        use super::{add_preserved_path, should_preserve_path};
+        use rstest::rstest;
+        use std::collections::HashSet;
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+        use tempfile::TempDir;
+
+        fn create_test_dir() -> TempDir {
+            tempfile::tempdir().unwrap()
+        }
+
+        #[rstest]
+        #[case::file_with_recursive(true, false)]
+        #[case::file_without_recursive(false, false)]
+        #[case::file_with_symlink_recursive(true, true)]
+        #[case::file_with_symlink_without_recursive(false, true)]
+        fn test_preserve_file_mechanism(#[case] _recursive: bool, #[case] use_symlink: bool) {
+            let temp_dir = create_test_dir();
+            let test_dir = temp_dir.path();
+
+            // Create test files
+            let preserved_file = test_dir.join("preserved_file");
+            let other_file = test_dir.join("other_file");
+            fs::write(&preserved_file, "content").unwrap();
+            fs::write(&other_file, "other").unwrap();
+
+            let mut paths_to_preserve: HashSet<(u64, u64)> = HashSet::new();
+            add_preserved_path(&mut paths_to_preserve, &preserved_file);
+
+            let target = if use_symlink {
+                let symlink_path = test_dir.join("symlink_to_file");
+                fs::symlink_metadata(&preserved_file).unwrap();
+                std::os::unix::fs::symlink(&preserved_file, &symlink_path).unwrap();
+                symlink_path
+            } else {
+                preserved_file.clone()
+            };
+
+            assert!(should_preserve_path(&target, &paths_to_preserve));
+
+            let preserved_metadata = fs::metadata(&preserved_file).unwrap();
+            let target_metadata = fs::metadata(&target).unwrap();
+            assert_eq!(preserved_metadata.dev(), target_metadata.dev());
+            assert_eq!(preserved_metadata.ino(), target_metadata.ino());
+        }
+
+        #[rstest]
+        #[case::directory_with_recursive(true, false)]
+        #[case::directory_without_recursive(false, false)]
+        #[case::directory_with_symlink_recursive(true, true)]
+        #[case::directory_with_symlink_without_recursive(false, true)]
+        fn test_preserve_directory_mechanism(#[case] _recursive: bool, #[case] use_symlink: bool) {
+            let temp_dir = create_test_dir();
+            let test_dir = temp_dir.path();
+
+            // Create test directory structure
+            let preserved_dir = test_dir.join("preserved_dir");
+            fs::create_dir(&preserved_dir).unwrap();
+            fs::write(preserved_dir.join("file1"), "content1").unwrap();
+            fs::write(preserved_dir.join("file2"), "content2").unwrap();
+            let subdir = preserved_dir.join("subdir");
+            fs::create_dir(&subdir).unwrap();
+            fs::write(subdir.join("file3"), "content3").unwrap();
+
+            let mut paths_to_preserve: HashSet<(u64, u64)> = HashSet::new();
+            add_preserved_path(&mut paths_to_preserve, &preserved_dir);
+
+            let target = if use_symlink {
+                let symlink_path = test_dir.join("symlink_to_dir");
+                std::os::unix::fs::symlink(&preserved_dir, &symlink_path).unwrap();
+                symlink_path
+            } else {
+                preserved_dir.clone()
+            };
+
+            assert!(should_preserve_path(&target, &paths_to_preserve));
+
+            let preserved_metadata = fs::metadata(&preserved_dir).unwrap();
+            let target_metadata = fs::metadata(&target).unwrap();
+            assert_eq!(preserved_metadata.dev(), target_metadata.dev());
+            assert_eq!(preserved_metadata.ino(), target_metadata.ino());
+        }
     }
 }

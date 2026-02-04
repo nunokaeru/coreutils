@@ -3951,6 +3951,7 @@ dependencies = [
  "fluent",
  "indicatif",
  "libc",
+ "rstest",
  "tempfile",
  "thiserror 2.0.18",
  "uucore",

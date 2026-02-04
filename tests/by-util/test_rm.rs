@@ -1275,6 +1275,67 @@ fn no_preserve_root_may_not_be_abbreviated() {
 }
 
 #[cfg(unix)]
+mod preserve_tests {
+    use uutests::{at_and_ucmd, new_ucmd};
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preserve_root_symlink_to_root() {
+        let (at, mut ucmd) = at_and_ucmd!();
+
+        at.symlink_dir("/", "rootlink");
+
+        ucmd.arg("-rf")
+            .arg("--preserve-root")
+            .arg("rootlink/")
+            .fails()
+            .stderr_contains("it is dangerous to operate recursively on")
+            .stderr_contains("(same as '/')");
+
+        assert!(at.symlink_exists("rootlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preserve_root_nested_symlink_to_root() {
+        let (at, mut ucmd) = at_and_ucmd!();
+
+        at.symlink_dir("/", "rootlink");
+        at.symlink_dir("rootlink", "rootlink2");
+
+        ucmd.arg("-rf")
+            .arg("--preserve-root")
+            .arg("rootlink2/")
+            .fails()
+            .stderr_contains("it is dangerous to operate recursively on")
+            .stderr_contains("(same as '/')");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preserve_root_symlink_removal_without_trailing_slash() {
+        let (at, mut ucmd) = at_and_ucmd!();
+
+        at.symlink_dir("/", "rootlink");
+
+        ucmd.arg("--preserve-root").arg("rootlink").succeeds();
+
+        assert!(!at.symlink_exists("rootlink"));
+    }
+
+    #[test]
+    fn test_preserve_root_literal_root() {
+        new_ucmd!()
+            .arg("-rf")
+            .arg("--preserve-root")
+            .arg("/")
+            .fails()
+            .stderr_contains("it is dangerous to operate recursively on '/'")
+            .stderr_contains("use --no-preserve-root to override this failsafe");
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn test_symlink_to_readonly_no_prompt() {
     let (at, mut ucmd) = at_and_ucmd!();
